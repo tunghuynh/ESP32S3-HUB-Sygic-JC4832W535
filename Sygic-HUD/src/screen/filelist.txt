@@ -1,0 +1,17 @@
+screens/ui_Screen1.c
+ui.c
+components/ui_comp_hook.c
+ui_helpers.c
+ui_events.c
+images/ui_img_direction_turn_straight_png.c
+images/ui_img_direction_close_png.c
+images/ui_img_direction_flag_png.c
+images/ui_img_direction_roundabout_png.c
+images/ui_img_direction_turn_left_png.c
+images/ui_img_direction_turn_right_png.c
+images/ui_img_direction_turn_sharp_left_png.c
+images/ui_img_direction_turn_sharp_right_png.c
+images/ui_img_direction_turn_slight_left_png.c
+images/ui_img_direction_turn_slight_right_png.c
+images/ui_img_direction_uturn_png.c
+fonts/ui_font_lvfontnotoserif14.c

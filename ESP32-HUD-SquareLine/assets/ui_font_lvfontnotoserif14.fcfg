@@ -1,0 +1,17 @@
+{
+  "codename": "lvfontnotoserif14",
+  "ttf_path": "/assets/NotoSerif-Regular.ttf",
+  "bin_path": "/assets\\ui_font_lvfontnotoserif14.bin",
+  "c_path": "/assets\\ui_font_lvfontnotoserif14.c",
+  "cfg_path": "/assets\\ui_font_lvfontnotoserif14.fcfg",
+  "size": 14,
+  "bpp": 2,
+  "letters": 0,
+  "ranges": [
+    "0x0020-0x007F",
+    "0x00C0-0x1EFF"
+  ],
+  "symbols": "",
+  "customparams": "--no-compress --no-prefilter",
+  "uploaded": false
+}

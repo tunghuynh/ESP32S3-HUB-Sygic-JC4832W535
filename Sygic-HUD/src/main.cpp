@@ -1,0 +1,458 @@
+/* Using LVGL with Arduino requires some extra steps:
+   Be sure to read the docs here: https://docs.lvgl.io/master/details/integration/framework/arduino.html
+   To use the built-in examples and demos of LVGL uncomment the includes below respectively.
+   You also need to copy 'lvgl/examples' to 'lvgl/src/examples'. Similarly for the demos 'lvgl/demos' to 'lvgl/src/demos'.
+*/
+
+#include "lv_conf.h"
+#include <lvgl.h>
+#include <Arduino.h>
+#include "pincfg.h"
+#include "dispcfg.h"
+#include "AXS15231B_touch.h"
+#include <Arduino_GFX_Library.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#include "ui.h"
+
+// Sygic BLE Service and Characteristic UUIDs
+#define SERVICE_UUID        "DD3F0AD1-6239-4E1F-81F1-91F6C9F01D86"
+#define CHAR_INDICATE_UUID  "DD3F0AD2-6239-4E1F-81F1-91F6C9F01D86"
+#define CHAR_WRITE_UUID     "DD3F0AD3-6239-4E1F-81F1-91F6C9F01D86"
+
+Arduino_DataBus *bus = new Arduino_ESP32QSPI(TFT_CS, TFT_SCK, TFT_SDA0, TFT_SDA1, TFT_SDA2, TFT_SDA3);
+Arduino_GFX *g = new Arduino_AXS15231B(bus, GFX_NOT_DEFINED, 0, false, TFT_res_W, TFT_res_H);
+Arduino_Canvas *gfx = new Arduino_Canvas(TFT_res_W, TFT_res_H, g, 0, 0, TFT_rot);
+AXS15231B_Touch touch(Touch_SCL, Touch_SDA, Touch_INT, Touch_ADDR, TFT_rot);
+
+// BLE variables
+BLECharacteristic *pWriteCharacteristic;
+bool deviceConnected = false;
+uint32_t initialDistance = 0;
+uint32_t currentDistance = 0;
+
+// Navigation data structure
+struct NavigationData {
+    uint8_t speed = 0;
+    uint8_t speedLimit = 0;
+    uint8_t direction = 0x00;
+    uint32_t distance = 0;
+    String roadName = "Road";
+    String eta = "--:--";
+    String status = "No route";
+    bool hasRoute = false;
+} navData;
+
+// Callback so LVGL know the elapsed time
+uint32_t millis_cb(void) {
+    return millis();
+}
+
+// Function to get direction image based on direction code
+const lv_img_dsc_t* getDirectionImage(uint8_t direction) {
+    switch (direction) {
+        case 0x08: return &ui_img_direction_turn_left_png;          // Turn left
+        case 0x0A: return &ui_img_direction_turn_right_png;         // Turn right
+        case 0x04: return &ui_img_direction_turn_straight_png;      // Go straight
+        case 0x07: return &ui_img_direction_turn_sharp_left_png;    // Sharp left
+        case 0x09: return &ui_img_direction_turn_sharp_right_png;   // Sharp right
+        case 0x05: return &ui_img_direction_turn_slight_left_png;   // Slight left
+        case 0x06: return &ui_img_direction_turn_slight_right_png;  // Slight right
+        case 0x0B: return &ui_img_direction_uturn_png;              // U-turn
+        case 0x0C: return &ui_img_direction_roundabout_png;         // Roundabout
+        case 0x00: return &ui_img_direction_flag_png;               // Destination
+        default:   return &ui_img_direction_close_png;              // Unknown
+    }
+}
+
+// Function to format distance display
+String formatDistance(uint32_t distance) {
+    if (distance >= 1000) {
+        float km = distance / 1000.0;
+        return String(km, 1) + "km";
+    } else {
+        return String(distance) + "m";
+    }
+}
+
+// Static buffers for UI text to prevent crashes
+static char distanceBuffer[32];
+static char speedBuffer[16];
+static char speedLimitBuffer[16];
+static char etaBuffer[64];
+
+// Function to update all UI elements
+void updateUI() {
+    // Update direction image
+    lv_image_set_src(ui_imgDirection, getDirectionImage(navData.direction));
+    
+    // Update distance - use static buffer
+    String distStr = formatDistance(navData.distance);
+    strncpy(distanceBuffer, distStr.c_str(), sizeof(distanceBuffer) - 1);
+    distanceBuffer[sizeof(distanceBuffer) - 1] = '\0';
+    lv_label_set_text(ui_lbDistance, distanceBuffer);
+    
+    // Update speed - use static buffer
+    snprintf(speedBuffer, sizeof(speedBuffer), "%d", navData.speed);
+    lv_label_set_text(ui_lbSpeed, speedBuffer);
+    
+    // Update speed limit - use static buffer
+    snprintf(speedLimitBuffer, sizeof(speedLimitBuffer), "%d", navData.speedLimit);
+    lv_label_set_text(ui_lbLimit, speedLimitBuffer);
+    
+    // Update ETA - use static buffer
+    snprintf(etaBuffer, sizeof(etaBuffer), "ETA: %s", navData.eta.c_str());
+    lv_label_set_text(ui_lbETA, etaBuffer);
+    
+    // Update status
+    lv_label_set_text(ui_lbStatus, navData.status.c_str());
+    
+    // Update road name
+    lv_label_set_text(ui_lbRoad, navData.roadName.c_str());
+    
+    // Update distance progress bar
+    if (navData.hasRoute && initialDistance > 0) {
+        uint32_t distanceTravelled = initialDistance - navData.distance;
+        int progress = map(distanceTravelled, 0, initialDistance, 0, 100);
+        lv_bar_set_value(ui_pgDistanceBar, progress, LV_ANIM_ON);
+    } else {
+        lv_bar_set_value(ui_pgDistanceBar, 0, LV_ANIM_ON);
+    }
+    
+    // Update Bluetooth status
+    if (deviceConnected) {
+        lv_label_set_text(ui_lbBT, "BT: Connected");
+        lv_obj_set_style_text_color(ui_lbBT, lv_color_hex(0x0DFF00), LV_PART_MAIN);  // Green
+    } else {
+        lv_label_set_text(ui_lbBT, "BT: Disconnected");
+        lv_obj_set_style_text_color(ui_lbBT, lv_color_hex(0xFF0000), LV_PART_MAIN);  // Red
+    }
+}
+
+// Function to parse serial commands for testing
+void processSerialCommand() {
+    if (Serial.available()) {
+        String command = Serial.readStringUntil('\n');
+        command.trim();
+        
+        Serial.println("Received command: " + command);
+        
+        // Parse command format: "speed,limit,direction,roadname,distance,eta"
+        // Example: "75,120,8,Highway 101,350,12:45"
+        int commaIndex[5];
+        int commaCount = 0;
+        
+        // Find comma positions
+        for (int i = 0; i < command.length() && commaCount < 5; i++) {
+            if (command[i] == ',') {
+                commaIndex[commaCount] = i;
+                commaCount++;
+            }
+        }
+        
+        if (commaCount == 5) {
+            // Parse each field
+            navData.speed = command.substring(0, commaIndex[0]).toInt();
+            navData.speedLimit = command.substring(commaIndex[0] + 1, commaIndex[1]).toInt();
+            navData.direction = command.substring(commaIndex[1] + 1, commaIndex[2]).toInt();
+            navData.roadName = command.substring(commaIndex[2] + 1, commaIndex[3]);
+            navData.distance = command.substring(commaIndex[3] + 1, commaIndex[4]).toInt();
+            navData.eta = command.substring(commaIndex[4] + 1);
+            
+            // Set route status
+            navData.hasRoute = (navData.distance > 0);
+            navData.status = navData.hasRoute ? "Test Navigation" : "Test Destination";
+            
+            // Update initial distance for progress bar
+            if (navData.distance > initialDistance) {
+                initialDistance = navData.distance;
+            }
+            
+            // Update UI
+            updateUI();
+            
+            // Print parsed values
+            Serial.println("=== PARSED TEST DATA ===");
+            Serial.println("Speed: " + String(navData.speed) + " km/h");
+            Serial.println("Speed Limit: " + String(navData.speedLimit) + " km/h");
+            Serial.println("Direction: 0x" + String(navData.direction, HEX));
+            Serial.println("Road Name: " + navData.roadName);
+            Serial.println("Distance: " + String(navData.distance) + " m");
+            Serial.println("ETA: " + navData.eta);
+            Serial.println("Status: " + navData.status);
+            Serial.println("========================");
+        } else {
+            Serial.println("Invalid command format!");
+            Serial.println("Use format: speed,limit,direction,roadname,distance,eta");
+            Serial.println("Example: 75,120,8,Highway 101,350,12:45");
+            Serial.println("");
+            Serial.println("Direction codes:");
+            Serial.println("  4 = Straight");
+            Serial.println("  8 = Turn Left");
+            Serial.println("  10 = Turn Right");
+            Serial.println("  5 = Slight Left");
+            Serial.println("  6 = Slight Right");
+            Serial.println("  7 = Sharp Left");
+            Serial.println("  9 = Sharp Right");
+            Serial.println("  11 = U-Turn");
+            Serial.println("  12 = Roundabout");
+            Serial.println("  0 = Destination");
+        }
+    }
+}
+
+// BLE Server callback class
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+        Serial.println("Device connected to BLE");
+        navData.status = "BLE Connected";
+        updateUI();
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+        Serial.println("Device disconnected from BLE");
+        navData.status = "BLE Disconnected";
+        navData.hasRoute = false;
+        updateUI();
+        BLEDevice::startAdvertising();
+    }
+};
+
+// BLE Characteristic callback class
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+        Serial.print("Received BLE data, length = ");
+        Serial.print(value.length());
+        Serial.print(": ");
+        
+        if (value.length() > 0) {
+            // Print hex data for debugging
+            for (int i = 0; i < value.length(); i++) {
+                char tmp[4];
+                sprintf(tmp, "%02X ", value[i]);
+                Serial.print(tmp);
+            }
+            Serial.println();
+            
+            // Print string data from BLE
+            Serial.print("BLE String Data: \"");
+            for (int i = 0; i < value.length(); i++) {
+                if (value[i] >= 32 && value[i] <= 126) { // Printable ASCII characters
+                    Serial.print((char)value[i]);
+                } else {
+                    Serial.print(".");
+                }
+            }
+            Serial.println("\"");
+
+            // Parse navigation data from Sygic
+            if (value[0] == 0x01 && value.length() >= 3) {
+                // Based on the sample data: 01 32 0A 34 30 6D = ".2.40m"
+                // value[1] = 0x32 (50) seems to be speed limit, not vehicle speed
+                // value[2] = 0x0A direction code 
+                // value[3..end] = distance string "40m"
+                
+                navData.speedLimit = value[1];  // This appears to be speed limit
+                navData.direction = value[2];   // Direction code
+                navData.hasRoute = true;
+                navData.status = "Navigating";
+
+                Serial.print("Speed Limit: ");
+                Serial.print(navData.speedLimit);
+                Serial.print(" | Direction: 0x");
+                Serial.println(navData.direction, HEX);
+
+                // Parse distance string from remaining bytes
+                if (value.length() > 3) {
+                    std::string distanceStr = value.substr(3);
+                    Serial.print("Distance string: \"");
+                    Serial.print(distanceStr.c_str());
+                    Serial.println("\"");
+                    
+                    if (distanceStr == "No route") {
+                        Serial.println("Destination reached (No route)");
+                        navData.status = "Destination reached";
+                        navData.hasRoute = false;
+                        navData.direction = 0x00;  // Show destination flag
+                        navData.distance = 0;
+                    } 
+                    else {
+                        // Parse distance (e.g., "40m", "1.2km")
+                        if (distanceStr.find("km") != std::string::npos) {
+                            // Extract number before "km"
+                            std::string numStr = distanceStr.substr(0, distanceStr.find("km"));
+                            float distanceKm = atof(numStr.c_str());
+                            navData.distance = (uint32_t)(distanceKm * 1000);
+                        } else if (distanceStr.find("m") != std::string::npos) {
+                            // Extract number before "m"
+                            std::string numStr = distanceStr.substr(0, distanceStr.find("m"));
+                            navData.distance = atoi(numStr.c_str());
+                        }
+                        
+                        if (navData.distance > 0) {
+                            if (initialDistance == 0 || navData.distance > initialDistance) {
+                                initialDistance = navData.distance;
+                            }
+                            Serial.print("Parsed distance: ");
+                            Serial.print(navData.distance);
+                            Serial.println("m");
+                        }
+                    }
+                }
+
+                // Note: Vehicle speed, road name, and ETA are not in this BLE data format
+                // They may come in separate BLE packets or different characteristics
+                Serial.println("Note: Vehicle speed, road name, and ETA not found in this packet");
+
+                // Update UI with new data
+                updateUI();
+            }
+        } else {
+            Serial.println("No BLE data received");
+        }
+    }
+};
+
+// LVGL calls it when a rendered image needs to copied to the display
+void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+    uint32_t w = lv_area_get_width(area);
+    uint32_t h = lv_area_get_height(area);
+
+    gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h);
+
+    // Call it to tell LVGL everthing is ready
+    lv_disp_flush_ready(disp);
+}
+
+// Read the touchpad
+void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
+    uint16_t x, y;
+    if (touch.touched()) {
+        // Read touched point from touch module
+        touch.readData(&x, &y);
+
+        // Set the coordinates
+        data->point.x = x;
+        data->point.y = y;
+        data->state = LV_INDEV_STATE_PRESSED;
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
+
+void setup() {
+    #ifdef ARDUINO_USB_CDC_ON_BOOT
+    delay(2000);
+    #endif
+
+    Serial.begin(115200);
+    Serial.println("Arduino_GFX LVGL + Sygic BLE HUD");
+    String LVGL_Arduino = String('V') + lv_version_major() + "." + lv_version_minor() + "." + lv_version_patch() + " example";
+    Serial.println(LVGL_Arduino);
+
+    // Display setup
+    if(!gfx->begin(40000000UL)) {
+        Serial.println("Failed to initialize display!");
+        return;
+    }
+    gfx->fillScreen(BLACK);
+
+    // Switch backlight on
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);
+
+    // Touch setup
+    if(!touch.begin()) {
+        Serial.println("Failed to initialize touch module!");
+        return;
+    }
+    touch.enOffsetCorrection(true);
+    touch.setOffsets(Touch_X_min, Touch_X_max, TFT_res_W-1, Touch_Y_min, Touch_Y_max, TFT_res_H-1);
+
+    // Init LVGL
+    lv_init();
+
+    // Set a tick source so that LVGL will know how much time elapsed
+    lv_tick_set_cb(millis_cb);
+
+    // Initialize the display buffer
+    uint32_t screenWidth = gfx->width();
+    uint32_t screenHeight = gfx->height();
+    uint32_t bufSize = screenWidth * screenHeight / 10;
+    lv_color_t *disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!disp_draw_buf) {
+        Serial.println("LVGL failed to allocate display buffer!");
+        return;
+    }
+
+    // Initialize the display driver
+    lv_display_t *disp = lv_display_create(screenWidth, screenHeight);
+    lv_display_set_flush_cb(disp, my_disp_flush);
+    lv_display_set_buffers(disp, disp_draw_buf, NULL, bufSize * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+    // Initialize the input device driver
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, my_touchpad_read);
+
+    // Initialize UI
+    ui_init();
+    
+    // Initialize navigation data with default values
+    navData.status = "Starting...";
+    updateUI();
+
+    // Initialize BLE
+    Serial.println("Initializing BLE for Sygic connection...");
+    BLEDevice::init("ESP32_Sygic_HUD");
+    BLEServer *pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+
+    BLECharacteristic *pIndicateCharacteristic = pService->createCharacteristic(
+                        CHAR_INDICATE_UUID,
+                        BLECharacteristic::PROPERTY_INDICATE
+                      );
+    pIndicateCharacteristic->addDescriptor(new BLE2902());
+    pIndicateCharacteristic->setValue("");
+
+    pWriteCharacteristic = pService->createCharacteristic(
+                        CHAR_WRITE_UUID,
+                        BLECharacteristic::PROPERTY_WRITE
+                      );
+    pWriteCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+
+    pService->start();
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);
+    pAdvertising->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+    
+    navData.status = "Waiting for Sygic...";
+    updateUI();
+    Serial.println("Waiting for Sygic connection...");
+    Serial.println("");
+    Serial.println("=== SERIAL TEST INTERFACE ===");
+    Serial.println("Send test data format: speed,limit,direction,roadname,distance,eta");
+    Serial.println("Example: 75,120,8,Highway 101,350,12:45");
+    Serial.println("=============================");
+}
+
+void loop() {
+    lv_task_handler();
+    gfx->flush();
+    
+    // Process serial commands for testing
+    processSerialCommand();
+    
+    delay(5);  // Small delay to prevent overwhelming the system
+}
